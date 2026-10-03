@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+
+# Lab target has its own git repo (the agent's changes are inspected there with git diff)
+lab/ollama-lab/target-service/
+
+# Agent run logs (JSONL traces)
+runs/

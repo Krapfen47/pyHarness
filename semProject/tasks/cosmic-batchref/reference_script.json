@@ -1,0 +1,16 @@
+[
+  {"tool": "search_files", "args": {"query": "def change_batch_quantity"}},
+  {"tool": "read_file", "args": {"path": "src/allocation/service_layer/handlers.py"}},
+  {"tool": "edit_file", "args": {
+    "path": "src/allocation/service_layer/handlers.py",
+    "old": "class InvalidSku(Exception):\n    pass\n",
+    "new": "class InvalidSku(Exception):\n    pass\n\n\nclass InvalidBatchRef(Exception):\n    pass\n"
+  }},
+  {"tool": "edit_file", "args": {
+    "path": "src/allocation/service_layer/handlers.py",
+    "old": "        product = uow.products.get_by_batchref(batchref=cmd.ref)\n",
+    "new": "        product = uow.products.get_by_batchref(batchref=cmd.ref)\n        if product is None:\n            raise InvalidBatchRef(f\"Invalid batch ref {cmd.ref}\")\n"
+  }},
+  {"tool": "run_check", "args": {"name": "tests"}},
+  {"final": "Added InvalidBatchRef to handlers.py and raise it in change_batch_quantity when the batch reference is unknown. The 'tests' check passed."}
+]

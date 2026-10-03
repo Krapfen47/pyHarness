@@ -1,0 +1,34 @@
+[project]
+name = "pyharness"
+version = "0.1.0"
+description = "Agentic harness course: lab exercises + semester project"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyflakes>=4.0.1",
+    "python-dotenv>=1.2.3",
+]
+
+[tool.uv]
+package = false # plain project, not a publishable library
+
+[tool.pytest.ini_options]
+pythonpath = ["semProject"] # lets tests do `import harness`
+testpaths = ["semProject/tests"] # lab packages run their own unittest suites
+# Docker tests are slow and need Docker running, so they're skipped by default.
+# `uv run pytest -m docker` runs only them (a later -m replaces this one).
+addopts = ["-m", "not docker"]
+markers = ["docker: needs a running Docker daemon (run with: uv run pytest -m docker)"]
+
+[tool.ruff]
+line-length = 100
+src = [".", "semProject"] # so ruff knows `harness` is our own code
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"] # pycodestyle, pyflakes, isort, pyupgrade, bugbear
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.8",
+]

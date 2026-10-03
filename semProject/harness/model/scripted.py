@@ -1,0 +1,48 @@
+"""A fake model that replies from a script. Used by the tests and for dry runs.
+
+The handout: "Use scripted replies for repeatable controller tests." A real
+model gives different answers from run to run and needs a running server. A
+script gives the SAME answers every time, so a failing test always points at
+our code, never at the model's mood.
+"""
+
+import json
+
+from harness.model.base import Message
+
+
+class ScriptExhausted(RuntimeError):
+    """The controller asked for more replies than the script contains."""
+
+
+class ScriptedModel:
+    """Returns the scripted replies in order. Fits the ModelClient protocol.
+
+    Replies may be strings (sent exactly as written, so tests can send broken
+    JSON on purpose) or dicts (turned into JSON for convenience).
+    """
+
+    def __init__(self, replies: list[str | dict], repeat_last: bool = False):
+        self.replies = [r if isinstance(r, str) else json.dumps(r) for r in replies]
+        # repeat_last=True simulates a model stuck in a loop: it keeps sending
+        # the same request forever. The action-limit test relies on this.
+        self.repeat_last = repeat_last
+        # A copy of what the model was shown on every call. Tests read this to
+        # check e.g. that a tool result really came back to the model.
+        self.calls: list[list[Message]] = []
+
+    def request_action(self, messages: list[Message]) -> str:
+        # Copy the list: the controller keeps appending to the original, and we
+        # want a snapshot of what the model saw at THIS moment.
+        self.calls.append([dict(m) for m in messages])
+        index = len(self.calls) - 1
+        if index < len(self.replies):
+            return self.replies[index]
+        if self.repeat_last and self.replies:
+            return self.replies[-1]
+        raise ScriptExhausted(f"script has only {len(self.replies)} replies")
+
+    @property
+    def last_observation(self) -> dict:
+        """The newest tool result the model was shown, parsed back from JSON."""
+        return json.loads(self.calls[-1][-1]["content"])

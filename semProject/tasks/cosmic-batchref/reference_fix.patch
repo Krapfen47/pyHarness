@@ -1,0 +1,24 @@
+diff --git a/src/allocation/service_layer/handlers.py b/src/allocation/service_layer/handlers.py
+index 2d7aa8d..3f8d414 100644
+--- a/src/allocation/service_layer/handlers.py
++++ b/src/allocation/service_layer/handlers.py
+@@ -14,6 +14,10 @@ class InvalidSku(Exception):
+     pass
+ 
+ 
++class InvalidBatchRef(Exception):
++    pass
++
++
+ def add_batch(
+     cmd: commands.CreateBatch,
+     uow: unit_of_work.AbstractUnitOfWork,
+@@ -53,6 +57,8 @@ def change_batch_quantity(
+ ):
+     with uow:
+         product = uow.products.get_by_batchref(batchref=cmd.ref)
++        if product is None:
++            raise InvalidBatchRef(f"Invalid batch ref {cmd.ref}")
+         product.change_batch_quantity(ref=cmd.ref, qty=cmd.qty)
+         uow.commit()
+ 

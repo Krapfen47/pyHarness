@@ -1,0 +1,65 @@
+# Stage 1 task: a real bug in the Cosmic Python example application
+# (domain model + service layer + message bus + repository, with many tests).
+#
+# Everything a run needs is in this file; the harness code has nothing
+# target-specific in it. A different repository = a different task folder.
+
+name = "cosmic-batchref"
+
+[repository]
+url = "https://github.com/cosmicpython/code.git"
+# The exact starting commit (master on 2026-10-03). Pinning it means every
+# run, and the grader, starts from the very same code.
+commit = "14c84797ffa77255d53cf1a02fe6aafda2b68aeb"
+
+[task]
+# The request handed to the model, word for word.
+request = """
+Bug: changing the quantity of a batch that does not exist crashes.
+
+Sending commands.ChangeBatchQuantity(ref="no-such-batch", qty=10) through the
+message bus currently fails with
+    AttributeError: 'NoneType' object has no attribute 'change_batch_quantity'
+because the repository returns None for an unknown batch reference.
+
+Expected behaviour: just like allocate() raises InvalidSku for an unknown SKU,
+the change_batch_quantity handler must raise a new exception InvalidBatchRef
+with the message "Invalid batch ref <ref>", for example
+"Invalid batch ref no-such-batch". It must not commit the unit of work.
+Changing a batch that does exist must keep working as before.
+
+Callers will import the exception as
+    from allocation.service_layer.handlers import InvalidBatchRef
+so define the class in src/allocation/service_layer/handlers.py, next to
+InvalidSku. Do not create a new module for it.
+
+Existing tests must keep passing. You may add a unit test in tests/unit/.
+"""
+# What may change: an ALLOW-list. Everything else in the repository is read-only
+# for the agent (enforced by PathGuard and double-checked by verification).
+writable = ["src/allocation", "tests/unit"]
+
+[sandbox]
+dockerfile = "sandbox/Dockerfile"
+# The acceptance test lives HERE, outside the agent's workspace. The sandbox
+# mounts it read-only at /acceptance; the agent can neither read nor change it.
+acceptance_dir = "acceptance"
+# The app is not pip-installed in the image (the code is mounted fresh for
+# every check), so Python is told where to find the `allocation` package.
+env = { PYTHONPATH = "/work/src" }
+
+# Checks the MODEL may run (by name, via the run_check tool).
+# Two upstream tests are left out because they need a live Postgres database
+# and a mail server; the sandbox has no network on purpose. The other 26
+# tests (unit tests + SQLite integration tests) run fully offline.
+[checks]
+tests = "python -m pytest -q -p no:cacheprovider tests/unit tests/integration --ignore=tests/integration/test_email.py -k 'not test_concurrent_updates_to_version_are_not_allowed'"
+
+# Checks the HARNESS runs after the model stops. All must pass for "verified".
+#   acceptance: the hidden check for this bug (fails on the starting code)
+#   regression: the existing tests (pass on the starting code, must still pass)
+# -p no:cacheprovider: pytest would otherwise try to write a cache folder,
+# but the mounted code is read-only.
+[verification]
+acceptance = "python -m pytest -q -p no:cacheprovider /acceptance"
+regression = "python -m pytest -q -p no:cacheprovider tests/unit tests/integration --ignore=tests/integration/test_email.py -k 'not test_concurrent_updates_to_version_are_not_allowed'"
