@@ -1,0 +1,5 @@
+# Binary files must never get line-ending conversion (core.autocrlf would
+# otherwise turn \n bytes inside them into \r\n on checkout and corrupt them).
+*.pdf binary
+*.png binary
+*.zip binary
