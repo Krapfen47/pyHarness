@@ -18,7 +18,17 @@ has its own counter and limit:
 
 
 class InvalidRequest(Exception):
-    """The model's reply is not a valid action. Nothing was executed."""
+    """The model's reply is not a valid action. Nothing was executed.
+
+    `gate` names the check that said no, in the order the checks run:
+    "json" (not JSON at all), "shape" (not one of the two allowed forms),
+    "tool" (unknown tool name), "args" (wrong or oversized arguments).
+    The GUI shows it as the red step of the validation pipeline.
+    """
+
+    def __init__(self, message: str, gate: str = "shape"):
+        super().__init__(message)
+        self.gate = gate
 
 
 class Denied(Exception):

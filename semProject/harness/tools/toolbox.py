@@ -77,16 +77,18 @@ class Toolbox:
     def validate(self, action: dict) -> None:
         tool, args = action.get("tool"), action.get("args", {})
         if not isinstance(tool, str) or tool not in self.specs:
-            raise InvalidRequest(f"unknown tool: {tool!r}. Available: {sorted(self.specs)}")
+            raise InvalidRequest(f"unknown tool: {tool!r}. Available: {sorted(self.specs)}",
+                                 gate="tool")
         spec = self.specs[tool]
         if not isinstance(args, dict) or set(args) != set(spec.params):
-            raise InvalidRequest(f"{tool} takes exactly these arguments: {list(spec.params)}")
+            raise InvalidRequest(f"{tool} takes exactly these arguments: {list(spec.params)}",
+                                 gate="args")
         for name, value in args.items():
             if not isinstance(value, str):
-                raise InvalidRequest(f"argument {name!r} must be a string")
+                raise InvalidRequest(f"argument {name!r} must be a string", gate="args")
             if len(value) > self.limits.max_arg_chars:
                 raise InvalidRequest(f"argument {name!r} is longer than "
-                                     f"{self.limits.max_arg_chars} characters")
+                                     f"{self.limits.max_arg_chars} characters", gate="args")
 
     # One place turns the three exception labels into results. OSError (disk,
     # permissions) and UnicodeError (file isn't UTF-8 text) are errors too: a

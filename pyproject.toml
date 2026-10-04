@@ -5,8 +5,10 @@ description = "Agentic harness course: lab exercises + semester project"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.142.2",
     "pyflakes>=4.0.1",
     "python-dotenv>=1.2.3",
+    "uvicorn>=0.54.0",
 ]
 
 [tool.uv]
@@ -29,6 +31,7 @@ select = ["E", "F", "I", "UP", "B"] # pycodestyle, pyflakes, isort, pyupgrade, b
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.13.1",
     "pytest>=9.1.1",
     "ruff>=0.16.8",
 ]

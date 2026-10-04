@@ -1,46 +1,35 @@
-"""Command-line interface: the only part that talks to the human.
+"""Command-line interface: the only part that talks to the human in a terminal.
 
     uv run semProject/main.py run      --task semProject/tasks/cosmic-batchref
     uv run semProject/main.py baseline --task semProject/tasks/cosmic-batchref
+    uv run semProject/main.py gui
 
 `run`       clones a fresh workspace, lets the model work, then verifies.
 `baseline`  clones a fresh workspace and ONLY verifies. On the starting code the
             acceptance check must fail (that proves the check detects the bug);
             with `--patch reference_fix.patch` it must pass.
+`gui`       starts the web interface (see harness/gui/) instead.
 
-Everything that involves the terminal lives here: arguments, printing, colors,
-the log file. The controller, tools and sandbox never print. That split means
-the core can be tested without a terminal, and a web UI could replace this
-file later without touching anything else.
+The run itself lives in runner.py. This file only reads the arguments and
+turns the run's events into lines of text: arguments, printing, colors.
+The controller, tools and sandbox never print. That split means the core can
+be tested without a terminal, and the GUI shows exactly the same run.
 """
 
 import argparse
 import json
 import os
 import sys
-import tempfile
-from datetime import datetime
-from pathlib import Path
 
 from dotenv import load_dotenv
 
-from harness.context import describe_repository
-from harness.controller import FINAL, AgentController, RunOutcome
+from harness.controller import FINAL, RunOutcome
+from harness.events import EventStream, Logger, new_run_id
 from harness.execution.base import PASSED
-from harness.execution.sandbox import DockerSandbox, SandboxError
 from harness.limits import Limits
-from harness.model.ollama import DEFAULT_MODEL, OllamaModel
-from harness.model.scripted import ScriptedModel
-from harness.task import TaskError, load_task
-from harness.tools.paths import PathGuard
-from harness.tools.repo import RepositoryTools
-from harness.tools.toolbox import Toolbox
-from harness.verification import Verification, VerificationReport
-from harness.workspace import Workspace, WorkspaceError
-
-PROJECT_DIR = Path(__file__).resolve().parents[1]  # .../semProject
-RUNS_DIR = PROJECT_DIR / "runs"  # JSONL logs (git-ignored)
-
+from harness.model.ollama import DEFAULT_MODEL
+from harness.runner import RUNS_DIR, SETUP_ERRORS, HarnessRun, RunRequest
+from harness.verification import VerificationReport
 
 # ---- output helpers ----
 
@@ -75,32 +64,12 @@ def short(value: object, limit: int = 140) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
-class Logger:
-    """Writes every event as one JSON line, so a run can be replayed and compared later.
-
-    Line-buffered (buffering=1): each line hits the disk immediately, so the
-    log is complete even if the run is killed halfway.
-    """
-
-    def __init__(self, path: Path):
-        self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = open(path, "a", encoding="utf-8", buffering=1)
-
-    def write(self, event: dict) -> None:
-        event = {"time": datetime.now().isoformat(timespec="seconds"), **event}
-        self.file.write(json.dumps(event, default=str, ensure_ascii=False) + "\n")
-
-    def close(self) -> None:
-        self.file.close()
-
-
 # ---- the user interface ----
 
 class ConsoleUI:
     """The handout's UserInterface: submit_task() in, show_result() out."""
 
-    def __init__(self, logger: Logger | None = None):
+    def __init__(self):
         # Color only for a real terminal, and never if NO_COLOR is set (a
         # common convention). os.system("") is an old trick that switches
         # older Windows consoles into "understand color codes" mode.
@@ -108,7 +77,6 @@ class ConsoleUI:
         if color and os.name == "nt":
             os.system("")
         self.s = Style(color)
-        self.logger = logger
 
     @staticmethod
     def submit_task(argv: list[str] | None = None) -> argparse.Namespace:
@@ -129,6 +97,11 @@ class ConsoleUI:
         base.add_argument("--task", required=True)
         base.add_argument("--patch", help="apply this patch first (e.g. a reference fix)")
         base.add_argument("--workdir")
+
+        gui = commands.add_parser("gui", help="start the web interface")
+        gui.add_argument("--port", type=int, default=8765)
+        gui.add_argument("--no-browser", action="store_true",
+                         help="don't open a browser window automatically")
         return parser.parse_args(argv)
 
     # ---- progress ----
@@ -137,12 +110,14 @@ class ConsoleUI:
         print(text, flush=True)
 
     def event(self, event: dict) -> None:
-        """Called by the controller for every step: log it and print one line."""
-        if self.logger:
-            self.logger.write(event)
+        """Called for every event of the run: print one line for the ones a human needs."""
         s, kind = self.s, event.get("type")
         turn = f"[{event.get('turn', '-'):>2}]"
-        if kind == "request":
+        if kind == "setup":
+            self.show_setup(event)
+        elif kind == "verify_start":
+            self.show("\nverifying in fresh sandbox containers ...")
+        elif kind == "request":
             action = event["action"]
             self.show(f"{turn} -> {s.cyan(action['tool'])} {short(action.get('args', {}))}")
         elif kind == "result":
@@ -161,6 +136,26 @@ class ConsoleUI:
             self.show(f"{' ' * len(turn)}    {s.yellow('(repeated request: model was told so)')}")
         elif kind == "stop":
             self.show(f"== stopped: {event['stop_reason']} after {event['turns']} turn(s)")
+        # Everything else (model_token, model_reply, observation, ...) is
+        # still in the log file and the GUI; the terminal stays readable.
+
+    def show_setup(self, event: dict) -> None:
+        step, status = event["step"], event["status"]
+        if step == "task":
+            self.show(f"task:      {event['task']} @ {event['commit'][:12]}")
+        elif step == "workspace":
+            self.show(f"workspace: {event['path']}")
+        elif step == "sandbox" and status == "building":
+            self.show(f"sandbox:   building image {event['image']} "
+                      "(first run only, may take minutes)")
+        elif step == "sandbox" and status == "ok":
+            self.show(f"sandbox:   {event['image']}")
+        elif step == "sandbox":
+            self.show(self.s.red(f"sandbox:   UNAVAILABLE - {event['detail']}"))
+        elif step == "patch":
+            self.show(f"patch:     applied {event['patch']}")
+        elif step == "model":
+            self.show(f"model:     {event['model']}\n")
 
     # ---- the result ----
 
@@ -217,78 +212,13 @@ class ConsoleUI:
 
 # ---- commands ----
 
-def prepare(task_path: str, workdir: str | None, ui: ConsoleUI, limits: Limits):
-    """Shared setup: load task, clone workspace, get the sandbox image ready."""
-    task = load_task(task_path)
-    parent = Path(workdir or os.environ.get("HARNESS_WORKDIR")
-                  or Path(tempfile.gettempdir()) / "harness-runs")
-    ui.show(f"task:      {task.name} @ {task.commit[:12]}")
-    workspace = Workspace.create(task.repo_url, task.commit, parent)
-    ui.show(f"workspace: {workspace.path}")
-    sandbox = DockerSandbox.for_task(task, workspace.path, limits)
-    problem = sandbox.problem()
-    if problem:
-        # We keep going: the run itself can still happen, but every check
-        # will be reported as UNAVAILABLE, and the verdict can't be "verified".
-        ui.show(ui.s.red(f"sandbox:   UNAVAILABLE - {problem}"))
-    else:
-        try:
-            sandbox.ensure_image(task.dockerfile, on_build=lambda image: ui.show(
-                f"sandbox:   building image {image} (first run only, may take minutes)"))
-            ui.show(f"sandbox:   {sandbox.image}")
-        except SandboxError as exc:
-            ui.show(ui.s.red(f"sandbox:   UNAVAILABLE - {exc}"))
-            sandbox.mark_unavailable("the sandbox image could not be built (see above)")
-    guard = PathGuard(workspace.path, task.writable)
-    return task, workspace, sandbox, guard
-
-
-def run(opts: argparse.Namespace, ui: ConsoleUI) -> int:
-    limits = Limits(max_actions=opts.max_actions)
-    task, workspace, sandbox, guard = prepare(opts.task, opts.workdir, ui, limits)
-    repo = RepositoryTools(guard, limits)
-    toolbox = Toolbox(repo, sandbox, task.agent_checks, limits)
-
-    if opts.script:
-        replies = json.loads(Path(opts.script).read_text(encoding="utf-8"))
-        model, model_name = ScriptedModel(replies), f"script:{opts.script}"
-    else:
-        model = OllamaModel(opts.model)
-        model_name = model.model_name
-    ui.show(f"model:     {model_name}\n")
-    ui.event({"type": "start", "task": task.name, "commit": task.commit, "model": model_name,
-              "workspace": str(workspace.path), "limits": limits.__dict__})
-
-    listing = repo.list_files()
-    context = describe_repository(listing["files"], task.writable, listing["truncated"])
-    controller = AgentController(model, toolbox, limits, emit=ui.event)
-    # try/finally: whatever happens (an error, Ctrl+C), no container survives.
-    try:
-        outcome = controller.run_task(task.request, context)
-        ui.show("\nverifying in fresh sandbox containers ...")
-        report = Verification(sandbox, workspace, list(task.verification), guard).report()
-    finally:
-        sandbox.stop_processes()
-    ui.event({"type": "verification", "passed": report.passed,
-              "checks": [c.to_dict() for c in report.checks],
-              "changed_files": report.changed_files, "diff": report.diff})
-    ui.show_result(outcome, report)
-    return 0 if report.passed else 1
-
-
-def baseline(opts: argparse.Namespace, ui: ConsoleUI) -> int:
-    limits = Limits()
-    task, workspace, sandbox, guard = prepare(opts.task, opts.workdir, ui, limits)
-    if opts.patch:
-        workspace.apply_patch(Path(opts.patch))
-        ui.show(f"patch:     applied {opts.patch}")
-    ui.show("\nverifying in fresh sandbox containers ...")
-    try:
-        report = Verification(sandbox, workspace, list(task.verification), guard).report()
-    finally:
-        sandbox.stop_processes()
-    ui.show_report(report)
-    return 0 if report.passed else 1
+def request_from(opts: argparse.Namespace) -> RunRequest:
+    """Translate command-line options into the runner's RunRequest."""
+    if opts.command == "baseline":
+        return RunRequest(task=opts.task, mode="baseline", patch=opts.patch,
+                          workdir=opts.workdir)
+    return RunRequest(task=opts.task, mode="run", model=opts.model, script=opts.script,
+                      max_actions=opts.max_actions, workdir=opts.workdir)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -296,14 +226,25 @@ def main(argv: list[str] | None = None) -> int:
     # Never crash on a character the console can't show (old Windows code pages).
     sys.stdout.reconfigure(errors="replace")
     opts = ConsoleUI.submit_task(argv)
+    if opts.command == "gui":
+        # Imported only here, so the plain CLI never loads the web server.
+        from harness.gui.server import serve
+        return serve(port=opts.port, open_browser=not opts.no_browser)
 
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    logger = Logger(RUNS_DIR / f"{run_id}-{opts.command}.jsonl")
-    ui = ConsoleUI(logger)
+    run_id = new_run_id(opts.command)
+    logger = Logger(RUNS_DIR / f"{run_id}.jsonl")
+    ui = ConsoleUI()
+    # Every event goes to the log file AND to the console printer.
+    events = EventStream(run_id, [logger.write, ui.event])
     ui.show(f"log:       {logger.path}")
     try:
-        return {"run": run, "baseline": baseline}[opts.command](opts, ui)
-    except (TaskError, WorkspaceError, SandboxError) as exc:
+        result = HarnessRun(request_from(opts), events.emit).execute()
+        if result.outcome is None:
+            ui.show_report(result.report)
+        else:
+            ui.show_result(result.outcome, result.report)
+        return result.exit_code
+    except SETUP_ERRORS as exc:
         # Setup problems: a clear message instead of a stack trace.
         ui.show(ui.s.red(f"error: {exc}"))
         return 2

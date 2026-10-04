@@ -11,14 +11,26 @@ it, so the controller cannot tell them apart. The handout requires exactly
 this: "Core tests must run without a live account or API key."
 """
 
+from collections.abc import Callable
 from typing import Protocol
 
 # One chat message, as every chat API uses it: {"role": "user", "content": "..."}.
 Message = dict[str, str]
 
+# Optional live-output callback: on_token(kind, text). It is called with each
+# small piece of the reply while the model is still writing it, so a UI can
+# show the text appear word by word ("streaming"). `kind` is "content" for
+# the reply itself, or "thinking" for the separate reasoning text that some
+# models (e.g. qwen3) write before answering.
+#
+# The callback may RAISE to abort the reply early. That is how the GUI's Stop
+# button works: the controller's callback raises Cancelled, and the model
+# client stops reading.
+OnToken = Callable[[str, str], None]
+
 
 class ModelClient(Protocol):
-    def request_action(self, messages: list[Message]) -> str:
+    def request_action(self, messages: list[Message], on_token: OnToken | None = None) -> str:
         """Send the whole conversation, get back the model's next reply as text.
 
         The reply is UNTRUSTED text. It is supposed to be one JSON action, but

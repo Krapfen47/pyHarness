@@ -10,3 +10,10 @@ lab/ollama-lab/target-service/
 
 # Agent run logs (JSONL traces)
 runs/
+
+# GUI frontend: installed packages and the build output (rebuilt with `npm run build`)
+node_modules/
+semProject/gui/dist/
+
+# Claude Code desktop preview config (local only)
+lab/ollama-lab/.claude/

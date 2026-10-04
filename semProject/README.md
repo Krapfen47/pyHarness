@@ -1,13 +1,16 @@
 # Stage 1: a small coding harness
 
-A command-line application that hands a bug-fix request to a local LLM, lets it
+An application that hands a bug-fix request to a local LLM, lets it
 read and edit a **disposable copy** of a repository through **checked tools**,
 lets it run tests in a **locked-down Docker container**, and then **verifies the
 result itself**: hidden acceptance test + existing tests + scope check + diff.
+It has two interfaces over the same run: a **CLI** and a **web GUI** that shows
+the internals live (streamed model replies, validation gates, prompts, checks).
 
 Built from scratch in Python on top of the week-1 lab code, with no agent
-framework. Runtime dependencies: the standard library plus `python-dotenv` and
-`pyflakes` (for lint-on-edit).
+framework. Runtime dependencies: the standard library plus `python-dotenv`,
+`pyflakes` (for lint-on-edit), and `fastapi` + `uvicorn` (only for the GUI's
+local web server). The GUI frontend is React + TypeScript, built with Vite.
 
 ## Run it
 
@@ -33,18 +36,65 @@ Options: `--model`, `--max-actions`, `--workdir`. Settings can also go in `.env`
 (see `.env.example`). The first run builds the sandbox image (about 30 s). Every
 run writes a JSONL log to `semProject/runs/`.
 
+## The GUI
+
+Requirements on top of the above: [Node.js](https://nodejs.org/) 20+ (only to
+build the frontend once).
+
+```bash
+cd semProject/gui && npm install && npm run build && cd ../..   # once, and after frontend changes
+uv run semProject/main.py gui                                   # opens http://127.0.0.1:8765
+```
+
+For frontend development, run `npm run dev` in `semProject/gui` as well and open
+http://localhost:5173 (instant reload; `/api` is forwarded to the Python server).
+
+What it shows:
+
+- **Launcher**: pick the task and a run type (model run, scripted demo, baseline,
+  baseline + reference fix), the Ollama model, and the action limit.
+- **Phase strip + live architecture diagram**: setup → context → agent loop →
+  verification → result; the box the latest event belongs to lights up.
+- **Timeline**: one card per turn. The model's reply **streams in token by
+  token**, then the **validation gates** it passed (json → shape → tool → args →
+  path guard), then the tool's result (edit diffs, check output). Invalid
+  replies, repeats, and replies cut off by Stop stay visible.
+- **Verdict**: the model's claim and the harness's verdict side by side.
+- **Inspector**: per turn the raw reply, thinking (for thinking models with
+  `OLLAMA_THINK=true`), Ollama's token counts and timings, the parsed action, the
+  full tool result, and the exact message sent back. The **Prompt** tab rebuilds
+  the exact list of messages the model saw on that turn. Plus Diff, Checks, Run.
+- **Budget bar**: actions / retries / denied against their limits, context size.
+- **Stop**: cuts off a streaming reply and removes the sandbox containers.
+- **History**: every JSONL log, replayable event by event with a slider.
+
+Greyed-out items tagged **S2** / **S3** (sessions, repo map, context manager,
+approvals, policy, autonomy mode) mark where Stage 2 and Stage 3 will plug in;
+they do nothing yet.
+
+The GUI only *displays* a run: it starts the same `HarnessRun` as the CLI and
+renders its events. It adds no new way to touch the repository. The server
+listens on 127.0.0.1 only, rejects requests whose `Host`/`Origin` name another
+site, and accepts task *names* (never paths) from the browser.
+
 ## Architecture
+
+Both interfaces sit on top of one run (`runner.py`) and only listen to its
+**events**; the CLI prints them, the GUI draws them, the logger stores them.
 
 ```mermaid
 flowchart TD
-    UI["cli.py<br/>ConsoleUI: submit_task / show_result"] --> C["controller.py<br/>AgentController: run_task / validate_action"]
-    C <--> M["model/<br/>OllamaModel | ScriptedModel"]
+    CLI["cli.py<br/>ConsoleUI: prints events"] --> RUN["runner.py<br/>HarnessRun: setup / loop / verification"]
+    GUI["gui/server.py + gui/manager.py<br/>REST + live SSE → React app"] --> RUN
+    RUN -- "events (events.py)" --> LOG["runs/*.jsonl"]
+    RUN --> C["controller.py<br/>AgentController: run_task / validate_action"]
+    C <--> M["model/<br/>OllamaModel (streaming) | ScriptedModel"]
     C --> T["tools/toolbox.py<br/>Toolbox: validate / run"]
     T --> R["tools/repo.py<br/>list / read / search / edit / write"]
     R --> G["tools/paths.py<br/>PathGuard (the file boundary)"]
     T --> X["execution/sandbox.py<br/>DockerSandbox: run_check / stop_processes"]
     CTX["context.py<br/>rules + task + file list"] --> C
-    UI --> V["verification.py<br/>run_acceptance_checks / show_diff"]
+    RUN --> V["verification.py<br/>run_acceptance_checks / show_diff"]
     V --> X
     V --> W["workspace.py<br/>git clone @ commit, diff"]
     G -.same folder.- W
@@ -68,9 +118,16 @@ flowchart LR
 The loop always ends: every turn either finishes, uses up one **action**, or
 uses up one **retry**, and both have hard limits.
 
+The events, in order: `launch`, `setup`, `start`, `context`, then per turn
+`model_call`, `model_token` (live only, not logged), `model_reply` or
+`model_aborted`, `invalid` or `request` + `result` (+ `repeat`), `observation`;
+then `stop`, `verify_start`, `check_start`/`check_end`, `verification`,
+`finished`. Each one is documented where it is emitted (`controller.py`,
+`runner.py`, `verification.py`) and typed in `gui/src/events.ts`.
+
 | Handout part | Where | Carried over from the lab |
 |---|---|---|
-| Interface | `cli.py` | `cli.py` (Logger, event printing) |
+| Interface | `cli.py`, `gui/` (server: `harness/gui/`), `runner.py`, `events.py` | `cli.py` (Logger, event printing) |
 | Controller | `controller.py`, `context.py` | `agent.py` (`run_agent`, `parse_action`) |
 | Model client | `model/ollama.py`, `model/scripted.py` | `model.py` |
 | Repository tools | `tools/repo.py`, `tools/paths.py`, `tools/toolbox.py`, `tools/lint.py` | `runtime.py` (tools, `resolve`, dispatch) |
@@ -94,6 +151,8 @@ and those run in Docker instead of on the host. Protected files became an
 | Original repo / pushing | Every run clones a fresh copy at a pinned commit; the `origin` remote is deleted |
 | Model claims success | Verification reruns everything itself; failed or unavailable checks stay visible |
 | Prompt injection via file contents | Tool results are labeled `untrusted_data`, but the hard guarantees above don't depend on the model obeying |
+| Another website driving the GUI's server | Listens on 127.0.0.1 only; `Host`/`Origin` checked on every request; the API takes task names, never paths or commands |
+| Stop pressed mid-run | Cancel flag checked between steps; the Ollama socket is closed (the reply stops at once); containers removed; skipped checks reported as unavailable |
 
 ## The task (`tasks/cosmic-batchref/`)
 
@@ -122,6 +181,9 @@ and those run in Docker instead of on the host. Protected files became an
 | Action limit, output limit (+ denied limit, timeout, no leftover processes) | `tests/test_limits.py` |
 | Sandbox flags, missing Docker | `tests/test_sandbox.py` |
 | Workspace + task file | `tests/test_workspace.py` |
+| Ollama streaming, stats, Stop mid-reply (against a fake Ollama server) | `tests/test_ollama_streaming.py` |
+| Whole run: phases, verdicts, Stop, setup errors (fake sandbox) | `tests/test_runner.py` |
+| GUI API: runs, history, one run at a time, local-only, live events | `tests/test_gui_api.py` |
 | Bug fix (scripted, real Docker), container lockdown, stuck container | `tests/test_docker_integration.py` (`-m docker`) |
 
 ## Real-model runs (GTX 980 Ti with 6 GB, 2026-10-03)

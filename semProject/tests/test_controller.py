@@ -2,10 +2,11 @@
 receives its result."""
 
 import json
+import threading
 
 from conftest import PRICING
 
-from harness.controller import FINAL, MODEL_ERROR, AgentController
+from harness.controller import CANCELLED, FINAL, MODEL_ERROR, AgentController
 from harness.model import ScriptedModel
 
 
@@ -53,8 +54,82 @@ def test_every_step_is_reported_as_an_event(toolbox, limits):
     model = ScriptedModel([{"tool": "list_files", "args": {}}, {"final": "done"}])
     AgentController(model, toolbox, limits, emit=events.append).run_task("Look around")
 
-    assert [e["type"] for e in events] == ["request", "result", "stop"]
+    # model_token events (the streamed pieces) are left out here; their
+    # number depends on how long the reply is.
+    assert [e["type"] for e in events if e["type"] != "model_token"] == [
+        "context",
+        "model_call", "model_reply", "request", "result", "observation",  # turn 1
+        "model_call", "model_reply",  # turn 2: the final answer
+        "stop",
+    ]
     assert events[-1]["stop_reason"] == FINAL
+
+
+def test_events_show_what_the_model_saw_and_said(toolbox, limits):
+    events = []
+    model = ScriptedModel([{"tool": "list_files", "args": {}}, {"final": "done"}])
+    AgentController(model, toolbox, limits, emit=events.append).run_task("Look around")
+    by_type = {}
+    for event in events:
+        by_type.setdefault(event["type"], []).append(event)
+
+    # The opening messages are exactly the ones the model got on turn 1.
+    assert by_type["context"][0]["messages"] == model.calls[0]
+    # Glued together, the streamed pieces of turn 1 are the full raw reply.
+    pieces = "".join(e["text"] for e in by_type["model_token"] if e["turn"] == 1)
+    assert pieces == by_type["model_reply"][0]["reply"] == model.replies[0]
+    # The observation event is exactly the message the model saw next.
+    assert by_type["observation"][0]["content"] == model.calls[1][-1]["content"]
+    assert by_type["result"][0]["budget"]["actions"] == 1
+
+
+def test_invalid_reply_reports_which_gate_failed(toolbox, limits):
+    events = []
+    model = ScriptedModel(["not json", {"tool": "shell", "args": {}},
+                           {"tool": "read_file", "args": {}}, {"final": "done"}])
+    AgentController(model, toolbox, limits, emit=events.append).run_task("x")
+    assert [e["gate"] for e in events if e["type"] == "invalid"] == ["json", "tool", "args"]
+
+
+def test_stop_flag_ends_the_run_before_the_next_turn(toolbox, limits):
+    cancel = threading.Event()
+
+    class StopsDuringFirstReply(ScriptedModel):
+        def request_action(self, messages, on_token=None):
+            cancel.set()  # the user presses Stop while the model is answering
+            return super().request_action(messages)
+
+    model = StopsDuringFirstReply([{"tool": "list_files", "args": {}}], repeat_last=True)
+    outcome = AgentController(model, toolbox, limits, cancel=cancel).run_task("x")
+    assert outcome.stop_reason == CANCELLED
+    assert len(model.calls) == 1  # no second model call after Stop
+
+
+def test_stop_during_streaming_aborts_the_reply(toolbox, limits):
+    cancel = threading.Event()
+
+    class SlowModel:
+        def request_action(self, messages, on_token=None):
+            on_token("content", '{"tool": ')
+            cancel.set()  # Stop pressed in the middle of the reply
+            on_token("content", '"list_files", "args": {}}')  # raises Cancelled
+            raise AssertionError("the reply should have been aborted")
+
+    events = []
+    outcome = AgentController(SlowModel(), toolbox, limits, emit=events.append,
+                              cancel=cancel).run_task("x")
+    assert outcome.stop_reason == CANCELLED
+    assert outcome.actions == 0
+    # What the model had written before Stop is kept, for the log and the GUI.
+    aborted = next(e for e in events if e["type"] == "model_aborted")
+    assert aborted["partial"] == '{"tool": '
+
+
+def test_a_model_error_keeps_the_reason_on_its_turn(toolbox, limits):
+    events = []
+    AgentController(ScriptedModel([]), toolbox, limits, emit=events.append).run_task("x")
+    aborted = next(e for e in events if e["type"] == "model_aborted")
+    assert aborted["turn"] == 1 and "ScriptExhausted" in aborted["reason"]
 
 
 def test_repeating_a_request_without_changes_gets_a_note(toolbox, limits):

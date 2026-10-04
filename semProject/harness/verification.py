@@ -15,10 +15,12 @@ verdict "not passed", no matter what the model said. This is the handout's
 "Keep failed or unavailable checks visible even if the model says it is done."
 """
 
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from harness.execution.base import FAILED, PASSED, CheckResult, ExecutionEnvironment
+from harness.execution.base import FAILED, PASSED, UNAVAILABLE, CheckResult, ExecutionEnvironment
 from harness.tools.paths import PathGuard
 
 
@@ -49,16 +51,35 @@ class Verification:
         workspace: DiffSource,
         check_names: list[str],
         guard: PathGuard | None = None,
+        emit: Callable[[dict], None] | None = None,
+        cancel: threading.Event | None = None,
     ):
         self.execution = execution
         self.workspace = workspace
         self.check_names = list(check_names)
         self.guard = guard
+        # emit: progress events (check_start / check_end), for the GUI's live
+        # view. cancel: the Stop button's flag (see controller.py).
+        self.emit = emit or (lambda event: None)
+        self.cancel = cancel or threading.Event()
 
     def run_acceptance_checks(self) -> list[CheckResult]:
-        results = [self.execution.run_check(name) for name in self.check_names]
+        results = []
+        for name in self.check_names:
+            self.emit({"type": "check_start", "name": name})
+            if self.cancel.is_set():
+                # Skipped checks are reported, not dropped: a stopped run
+                # must never look like a run where everything passed.
+                result = CheckResult(name, UNAVAILABLE, None, "skipped: the run was stopped")
+            else:
+                result = self.execution.run_check(name)
+            self.emit({"type": "check_end", **result.to_dict()})
+            results.append(result)
         if self.guard is not None:
-            results.append(self.check_scope())
+            self.emit({"type": "check_start", "name": "scope"})
+            result = self.check_scope()
+            self.emit({"type": "check_end", **result.to_dict()})
+            results.append(result)
         return results
 
     # Defense in depth: the file tools already refuse writes outside the

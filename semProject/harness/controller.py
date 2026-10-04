@@ -9,7 +9,7 @@ The handout's Figure 3, in code:
         if action is "final" -> stop              (the model THINKS it's done)
         result = toolbox.run(action)              run it, or get "denied"/"error"
         append reply + result to messages         return the result to the model
-    stop on: final answer, a limit, a model error, or Ctrl+C
+    stop on: final answer, a limit, a model error, Ctrl+C or the GUI's Stop button
 
 A language model has no memory between calls. Every turn it gets the whole
 conversation again and replies with ONE next step. The "agent" is nothing
@@ -23,9 +23,27 @@ Why this loop always ends: every turn either ends the run, adds 1 to
 `actions`, or adds 1 to `retries`. Both have a hard limit. So the number of
 model calls is at most max_actions + max_retries + 1, no matter what the
 model does.
+
+Everything the loop does is also reported as an EVENT (a small dict) through
+`emit`. The CLI prints them, the log file stores them, and the GUI draws them.
+The event types, in the order they happen:
+
+    context       the exact opening messages (rules + task + file list)
+    model_call    a turn starts: we ask the model (how much text it gets)
+    model_token   a piece of the reply, while the model is still writing
+    model_reply   the complete raw reply, how long it took, token counts
+    model_aborted the reply was cut off (Stop, Ctrl+C, model error): what was written so far
+    invalid       the reply failed validation (which gate, and why)
+    request       a valid tool request is about to run
+    result        what the tool returned (ok / denied / error)
+    repeat        the request repeated an earlier one with no change between
+    observation   the exact message that goes back to the model
+    stop          the loop ended, with the reason and all counters
 """
 
 import json
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
@@ -47,6 +65,10 @@ CANCELLED = "cancelled"
 # Tools that change files. After one of them succeeds, earlier results (file
 # contents, test output) may be outdated, so repeating a request is fine again.
 WRITE_TOOLS = {"edit_file", "write_file"}
+
+
+class Cancelled(Exception):
+    """The user asked the run to stop (the GUI's Stop button)."""
 
 
 @dataclass
@@ -79,7 +101,7 @@ REPEAT_NOTE = ("You already made this exact request and no file has changed sinc
 
 class AgentController:
     def __init__(self, model: ModelClient, toolbox: Toolbox, limits: Limits,
-                 emit: Emit | None = None):
+                 emit: Emit | None = None, cancel: threading.Event | None = None):
         self.model = model
         self.toolbox = toolbox
         self.limits = limits
@@ -87,6 +109,10 @@ class AgentController:
         # and logs them; tests can collect them in a list. The controller
         # itself never prints, so it stays easy to test.
         self.emit = emit or (lambda event: None)
+        # cancel: a thread-safe on/off flag. The GUI runs this loop in a
+        # background thread and sets the flag when the user presses Stop; the
+        # loop checks it between steps (and while the model is streaming).
+        self.cancel = cancel or threading.Event()
 
     # ---- step 2 of the loop: is this reply a valid action? ----
 
@@ -101,7 +127,7 @@ class AgentController:
         try:
             action = json.loads(reply)
         except json.JSONDecodeError as exc:
-            raise InvalidRequest(f"reply is not valid JSON: {exc}") from None
+            raise InvalidRequest(f"reply is not valid JSON: {exc}", gate="json") from None
         if not isinstance(action, dict):
             raise InvalidRequest("reply must be one JSON object")
 
@@ -118,10 +144,16 @@ class AgentController:
 
     def run_task(self, request: str, context: str = "") -> RunOutcome:
         messages = build_messages(request, self.toolbox.describe(), context)
+        self.emit({"type": "context", "messages": [dict(m) for m in messages]})
         turns = actions = retries = denied = errors = repeats = 0
         # Every request made since the last successful file change, as text.
         # A set gives a fast "have we seen this before?" check.
         seen_since_change: set[str] = set()
+
+        def budget() -> dict:
+            """The counters right now, so a UI can draw "3 of 30 actions used"."""
+            return {"actions": actions, "retries": retries, "denied": denied,
+                    "errors": errors, "repeats": repeats}
 
         # Every exit goes through here: build the outcome, emit a "stop"
         # event, return. One helper means no exit can forget the log entry.
@@ -132,16 +164,55 @@ class AgentController:
             return outcome
 
         while True:
+            if self.cancel.is_set():
+                return finish(CANCELLED, "stopped by the user")
             turns += 1
-            # 1. Ask the model. KeyboardInterrupt (Ctrl+C) is not an Exception
-            # subclass, precisely so a careless `except Exception` can't
-            # swallow it; it needs its own clause.
+
+            # 1. Ask the model. The reply streams in piece by piece; each
+            # piece becomes a model_token event (the GUI's live text).
+            self.emit({"type": "model_call", "turn": turns, "messages": len(messages),
+                       "chars": sum(len(m["content"]) for m in messages)})
+            thinking: list[str] = []
+            written: list[str] = []  # the reply so far, in case it gets cut off
+
+            # `turn=turns` freezes this turn's number into the function (a
+            # default value is computed once, when `def` runs). Without it,
+            # the function would read whatever `turns` is at call time.
+            def on_token(kind: str, text: str, turn: int = turns,
+                         thinking: list[str] = thinking, written: list[str] = written) -> None:
+                if self.cancel.is_set():
+                    raise Cancelled  # aborts the reply in the middle
+                (thinking if kind == "thinking" else written).append(text)
+                self.emit({"type": "model_token", "turn": turn, "kind": kind, "text": text})
+
+            started = time.monotonic()
+            # KeyboardInterrupt (Ctrl+C) is not an Exception subclass,
+            # precisely so a careless `except Exception` can't swallow it; it
+            # needs its own clause.
             try:
-                reply = self.model.request_action(messages)
-            except KeyboardInterrupt:
-                return finish(CANCELLED, "interrupted by the user")
-            except Exception as exc:
-                return finish(MODEL_ERROR, f"{type(exc).__name__}: {exc}")
+                reply = self.model.request_action(messages, on_token=on_token)
+            except (KeyboardInterrupt, Exception) as exc:  # Cancelled is an Exception too
+                # Stop closes the model's network connection, which surfaces
+                # here as an error. It was still the user's decision.
+                if isinstance(exc, KeyboardInterrupt):
+                    stop_reason, reason = CANCELLED, "interrupted by the user"
+                elif isinstance(exc, Cancelled) or self.cancel.is_set():
+                    stop_reason = CANCELLED
+                    reason = "stopped by the user while the model was writing"
+                else:
+                    stop_reason, reason = MODEL_ERROR, f"{type(exc).__name__}: {exc}"
+                # Keep whatever the model had written so far: the log (and the
+                # GUI after a reload) should show where it was cut off.
+                self.emit({"type": "model_aborted", "turn": turns, "reason": reason,
+                           "partial": "".join(written), "thinking": "".join(thinking) or None,
+                           "duration": round(time.monotonic() - started, 2)})
+                return finish(stop_reason, reason)
+            # getattr(obj, name, default): "use the stats if this model has
+            # any". The Ollama client does; the scripted model doesn't.
+            self.emit({"type": "model_reply", "turn": turns, "reply": reply,
+                       "thinking": "".join(thinking) or None,
+                       "duration": round(time.monotonic() - started, 2),
+                       "stats": getattr(self.model, "last_stats", None)})
             # Keep the reply even if it's broken: the model should see what it
             # said, followed by the error explaining what was wrong with it.
             messages.append({"role": "assistant", "content": reply})
@@ -152,10 +223,10 @@ class AgentController:
             except InvalidRequest as exc:
                 retries += 1
                 self.emit({"type": "invalid", "turn": turns, "error": str(exc),
-                           "reply": reply[:500]})
+                           "gate": exc.gate, "reply": reply[:500], "budget": budget()})
                 if retries > self.limits.max_retries:
                     return finish(RETRY_LIMIT, f"{retries} unusable replies")
-                messages.append(self.observation({"status": "invalid", "error": str(exc)}))
+                self.send_back(messages, turns, {"status": "invalid", "error": str(exc)})
                 continue
 
             # 3. A final answer ends the loop. It's a claim, not proof.
@@ -177,30 +248,42 @@ class AgentController:
                 return finish(CANCELLED, "interrupted during a tool call")
             except Exception as exc:
                 result = {"status": "error", "output": f"harness failure: {exc}"}
-            self.emit({"type": "result", "turn": turns, "tool": action["tool"],
-                       "result": result})
 
             if result["status"] == "denied":
                 denied += 1
-                if denied > self.limits.max_denied:
-                    return finish(DENIED_LIMIT, f"{denied} requests were denied")
             elif result["status"] == "error":
                 errors += 1
 
             # Repeat detection. sort_keys makes the text identical for identical
             # requests, whatever order the model wrote the arguments in.
             key = json.dumps(action, sort_keys=True)
-            observation = {"tool": action["tool"], **result}
-            if key in seen_since_change:
+            is_repeat = key in seen_since_change
+            if is_repeat:
                 repeats += 1
-                observation["note"] = REPEAT_NOTE
-                self.emit({"type": "repeat", "turn": turns, "tool": action["tool"]})
             seen_since_change.add(key)
             if action["tool"] in WRITE_TOOLS and result["status"] == "ok":
                 seen_since_change.clear()  # files changed: old results are outdated now
 
+            self.emit({"type": "result", "turn": turns, "tool": action["tool"],
+                       "result": result, "budget": budget()})
+            if is_repeat:
+                self.emit({"type": "repeat", "turn": turns, "tool": action["tool"]})
+            if denied > self.limits.max_denied:
+                return finish(DENIED_LIMIT, f"{denied} requests were denied")
+            if self.cancel.is_set():  # Stop pressed while the tool was running
+                return finish(CANCELLED, "stopped by the user during a tool call")
+
             # 6. Return the result to the model, so it can pick the next step.
-            messages.append(self.observation(observation))
+            observation = {"tool": action["tool"], **result}
+            if is_repeat:
+                observation["note"] = REPEAT_NOTE
+            self.send_back(messages, turns, observation)
+
+    def send_back(self, messages: list[Message], turn: int, payload: dict) -> None:
+        """Append a result message for the model, and report exactly what it says."""
+        message = self.observation(payload)
+        messages.append(message)
+        self.emit({"type": "observation", "turn": turn, "content": message["content"]})
 
     # Tool results go back as a "user" message containing JSON labelled
     # untrusted_data. If a tool forgot to clip its output, the safety net
