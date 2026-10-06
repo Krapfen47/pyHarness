@@ -15,15 +15,20 @@ local web server). The GUI frontend is React + TypeScript, built with Vite.
 ## Run it
 
 Requirements: [uv](https://docs.astral.sh/uv/), Git, Docker Desktop (running),
-Ollama with a model pulled (`ollama pull qwen2.5-coder:7b`).
+Ollama with a model pulled (`ollama pull qwen2.5-coder:14b`). No API keys or other
+secrets are needed: the model runs locally.
 
 ```bash
 uv sync                                                     # install dependencies
 uv run semProject/main.py baseline --task semProject/tasks/cosmic-batchref
-uv run semProject/main.py run --task semProject/tasks/cosmic-batchref
+uv run semProject/main.py run --task semProject/tasks/cosmic-batchref --model qwen2.5-coder:14b
 uv run pytest                                               # core tests (no Docker/model needed)
 uv run pytest -m docker                                     # container + end-to-end tests
 ```
+
+Without `--model`, the run uses `OLLAMA_MODEL` or `qwen2.5-coder:7b`. The 7B model
+failed all 6 of my test runs, so use 14B for a real repair (see
+[Real-model runs](#real-model-runs-gtx-980-ti-with-6-gb-2026-10-03)).
 
 | Command | What it does |
 |---|---|
@@ -188,9 +193,11 @@ and those run in Docker instead of on the host. Protected files became an
 
 ## Real-model runs (GTX 980 Ti with 6 GB, 2026-10-03)
 
-Logs are in `semProject/runs/`.
+The JSONL logs of these runs stay on my machine in `semProject/runs/`. That folder
+is git-ignored, so they aren't in the repository.
 
-**qwen2.5-coder:14b: VERIFIED, 2 of 2 runs.** In 4 turns it reads `handlers.py`,
+**qwen2.5-coder:14b: VERIFIED, 3 of 3 runs** (two from the CLI on 2026-10-03,
+one from the GUI on 2026-10-04). In 4 turns it reads `handlers.py`,
 adds the class and the `None` check in one edit, runs the tests, and finishes.
 Acceptance, regression and scope all pass. No manual help. About 2.5 minutes
 per run, because the model doesn't fit the 6 GB GPU and partly runs on the CPU:
