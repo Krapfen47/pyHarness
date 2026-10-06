@@ -46,7 +46,11 @@ BASH = os.environ.get("AGENT_BASH") or (
 )
 # Only what local commands need. Everything else (API keys!) stays out.
 # SYSTEMROOT is required on Windows or Python/bash fail to start.
-BASH_ENV_KEYS = ("PATH", "HOME", "LANG", "TEMP", "TMP", "SYSTEMROOT")
+# SYSTEMDRIVE (just "C:") is needed too: without it, some Windows programs
+# write to the literal path "%SystemDrive%\ProgramData\..." relative to the
+# working directory, i.e. they drop a junk folder INTO the target. Found when
+# the `python3` Store placeholder did exactly that.
+BASH_ENV_KEYS = ("PATH", "HOME", "LANG", "TEMP", "TMP", "SYSTEMROOT", "SYSTEMDRIVE")
 
 
 # Two exception types used as labels: deep inside a tool, code just raises
