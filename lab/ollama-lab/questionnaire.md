@@ -1,8 +1,6 @@
 # Week 1 questionnaire
 
-> DRAFT written with Claude Code from my code and run logs. Read every answer, rephrase it in your own words, then delete this line.
-
-Name and collaborators: Johann Hoffmann. AI assistance: Claude Code (details in `my-agent/README.md`).
+Name and collaborators: Johann Hoffmann. AI assistance: Claude Code helped write the agent, and it drafted these answers from my code and run logs. I reviewed them. Details are in `my-agent/README.md`.
 
 Answer each question in two to five clear sentences, using your own implementation.
 
